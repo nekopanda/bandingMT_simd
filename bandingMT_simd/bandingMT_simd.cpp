@@ -37,6 +37,8 @@
 #include "banding.h"
 #include "banding_version.h"
 #include "xor_rand.h"
+#include "plugin_utils.h"
+#include "cuda_filters.h"
 
 //---------------------------------------------------------------------
 //        フィルタ構造体定義
@@ -47,9 +49,9 @@ int        track_default[] =    {     15,  15,   15,    15,     15,        15,  
 int        track_s[] =            {      0,   0,    0,     0,      0,         0,         0,     0   };    //  トラックバーの下限値
 int        track_e[] =            {     63,  31,   31,    31,     31,        31,         2,   127   };    //  トラックバーの上限値
 
-#define    CHECK_N    3                                                                   //  チェックボックスの数
-TCHAR    *check_name[] =     { "ブラー処理を先に","毎フレーム乱数を生成","フィールド処理" }; //  チェックボックスの名前
-int         check_default[] =     { 0, 0, 0 };    //  チェックボックスの初期値 (値は0か1)
+#define    CHECK_N    4                                                                   //  チェックボックスの数
+TCHAR    *check_name[] =     { "ブラー処理を先に","毎フレーム乱数を生成","フィールド処理", "CUDA" }; //  チェックボックスの名前
+int         check_default[] =     { 0, 0, 0, 0 };    //  チェックボックスの初期値 (値は0か1)
 
 FILTER_DLL filter = {
     FILTER_FLAG_EX_INFORMATION,    //    フィルタのフラグ
@@ -104,6 +106,7 @@ EXTERN_C FILTER_DLL __declspec(dllexport) * __stdcall GetFilterTable( void )
 }
 
 BOOL func_init( FILTER *fp ) {
+    init_console();
     ZeroMemory(&band, sizeof(band));
     band.block_count_x = 1;
     band.block_count_y = 1;
@@ -275,6 +278,26 @@ void band_perf_check(FILTER *fp, FILTER_PROC_INFO *fpip) {
 }
 #endif
 
+static int banding_cuda(FILTER *fp, FILTER_PROC_INFO *fpip)
+{
+    CudaBandingParam prm = {};
+    prm.max_w = fpip->max_w;
+    prm.width = fpip->w;
+    prm.height = fpip->h;
+    prm.seed = fp->track[7];
+    prm.ditherY = fp->track[4];
+    prm.ditherC = fp->track[5];
+    prm.rand_each_frame = fp->check[1];
+    prm.sample_mode = fp->track[6];
+    prm.blur_first = fp->check[0];
+    prm.range = fp->track[0];
+    prm.threshold_y = fp->track[1] << (!(prm.sample_mode && prm.blur_first) + 1);
+    prm.threshold_cb = fp->track[2] << (!(prm.sample_mode && prm.blur_first) + 1);
+    prm.threshold_cr = fp->track[3] << (!(prm.sample_mode && prm.blur_first) + 1);
+    prm.interlaced = fp->check[2];
+    return cuda_filter_banding(&prm, fpip->ycp_edit, fpip->ycp_temp);
+}
+
 //---------------------------------------------------------------------
 //        フィルタ処理関数
 //---------------------------------------------------------------------
@@ -294,8 +317,18 @@ BOOL func_proc( FILTER *fp, FILTER_PROC_INFO *fpip )
     band.block_count_x = (fpip->w + 127) / 128;
     band.block_count_y = band.current_thread_num;
     
-    //    マルチスレッドでフィルタ処理関数を呼ぶ
-    fp->exfunc->exec_multi_thread_func(multi_thread_func, fp, fpip);
+    int64_t prev = get_time();
+
+    if (fp->check[3]) {
+        // CUDA版を呼び出す
+        banding_cuda(fp, fpip);
+    }
+    else {
+        //    マルチスレッドでフィルタ処理関数を呼ぶ
+        fp->exfunc->exec_multi_thread_func(multi_thread_func, fp, fpip);
+    }
+
+    print_time(prev, fp->check[3] ? "bandingCUDA:" : "bandingMT:");
 
 #if BANDING_PERF_CHECK
     band_perf_check(fp, fpip);
