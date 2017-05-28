@@ -31,6 +31,9 @@
 #include "banding.h"
 
 DWORD get_availableSIMD() {
+#ifndef NDEBUG
+    return NONE;
+#else
     int CPUInfo[4];
     __cpuid(CPUInfo, 1);
     DWORD simd = NONE;
@@ -54,6 +57,7 @@ DWORD get_availableSIMD() {
         simd |= AVX2;
 #endif
     return simd;
+#endif
 }
 
 DWORD cpu_core_count() {
@@ -236,59 +240,91 @@ void decrease_banding_mode0_c(int thread_id, int thread_num, FILTER* fp, FILTER_
 }
 
 void decrease_banding_mode12_c(int thread_id, int thread_num, FILTER* fp, FILTER_PROC_INFO *fpip) {
-    const int max_w  = fpip->max_w;
+    const int max_w = fpip->max_w;
     const int width = fpip->w;
     const int height = fpip->h;
-    const int seed    = fp->track[7];
+    const int seed = fp->track[7];
     const int ditherY = fp->track[4];
     const int ditherC = fp->track[5];
     const int  rand_each_frame = fp->check[1];
-    const int  sample_mode     = fp->track[6];
-    const int  blur_first      = fp->check[0];
-    const BYTE range           = fp->track[0];
-    const int  threshold_y     = fp->track[1] << (!(sample_mode && blur_first) + 1);
-    const int  threshold_cb    = fp->track[2] << (!(sample_mode && blur_first) + 1);
-    const int  threshold_cr    = fp->track[3] << (!(sample_mode && blur_first) + 1);
-    const int  y_start         = ( height *  thread_id    ) / thread_num;
-    const int  y_end           = ( height * (thread_id+1) ) / thread_num;
-    const BYTE field_mask      = fp->check[2] ? 0xfe : 0xff;
+    const int  sample_mode = fp->track[6];
+    const int  blur_first = fp->check[0];
+    const BYTE range = fp->track[0];
+    const int  threshold_y = fp->track[1] << (!(sample_mode && blur_first) + 1);
+    const int  threshold_cb = fp->track[2] << (!(sample_mode && blur_first) + 1);
+    const int  threshold_cr = fp->track[3] << (!(sample_mode && blur_first) + 1);
+    const int  y_start = (height *  thread_id) / thread_num;
+    const int  y_end = (height * (thread_id + 1)) / thread_num;
+    const BYTE field_mask = fp->check[2] ? 0xfe : 0xff;
     xor128_t gen_rand;
     xor128_init(&gen_rand, seed + (y_start << 2) + ((fpip->frame * rand_each_frame) << 4));
+
+    const int threshold_total = fp->track[8] << 2;
+    const bool total = fp->check[4] != 0;
+    const bool check = fp->check[5] != 0;
+
+    const PIXEL_YC YC_ORANGE = { 2255, -836,  1176 }; //調整 - 明 - 白補正対象
+    const PIXEL_YC YC_YELLOW = { 3514, -626,    73 }; //調整 - 明
+    const PIXEL_YC YC_SKY = { 3702,  169,  -610 }; //調整 - 暗
+    const PIXEL_YC YC_BLUE = { 1900, 1240,  -230 }; //調整 - 暗 - 黒補正対象
+    const PIXEL_YC YC_BLACK = { 1013,    0,     0 }; //エッジでない
 
     for (int y = y_start; y < y_end; y++) {
         PIXEL_YC *ycp_src = fpip->ycp_edit + y * max_w;
         PIXEL_YC *ycp_dst = fpip->ycp_temp + y * max_w;
-        int y_limit = min(y, height-y-1);
+        int y_limit = min(y, height - y - 1);
         for (int x = 0; x < width; x++, ycp_src++, ycp_dst++) {
-            const BYTE range_limited = min4(range, y_limit, x, width-x-1);
+            const BYTE range_limited = min4(range, y_limit, x, width - x - 1);
             xor128(&gen_rand);
-            const char refA = random_range((gen_rand.w & 0x00ff),      range_limited);
+            const char refA = random_range((gen_rand.w & 0x00ff), range_limited);
             const char refB = random_range((gen_rand.w & 0xff00) >> 8, range_limited);
             PIXEL_YC avg, diff;
             if (sample_mode == 1) {
                 const int ref = (char)(refA & field_mask) * max_w + refB;
                 avg = get_avg(ycp_src[ref], ycp_src[-ref]);
                 diff = (blur_first) ? get_diff_abs(ycp_src[0], avg)
-                                    : get_max(get_diff_abs(ycp_src[0], ycp_src[ ref]),
-                                              get_diff_abs(ycp_src[0], ycp_src[-ref]));
-            } else {
+                    : get_max(get_diff_abs(ycp_src[0], ycp_src[ref]),
+                        get_diff_abs(ycp_src[0], ycp_src[-ref]));
+            }
+            else {
                 const int ref_0 = (char)(refA & field_mask) * max_w + refB;
                 const int ref_1 = refA - (char)(refB & field_mask) * max_w;
-                avg = get_avg(ycp_src[ ref_0], ycp_src[-ref_0], ycp_src[ ref_1], ycp_src[-ref_1]);
+                avg = get_avg(ycp_src[ref_0], ycp_src[-ref_0], ycp_src[ref_1], ycp_src[-ref_1]);
                 diff = (blur_first) ? get_diff_abs(ycp_src[0], avg)
-                                    : get_max( get_diff_abs(ycp_src[0], ycp_src[ ref_0]),
-                                               get_diff_abs(ycp_src[0], ycp_src[-ref_0]),
-                                               get_diff_abs(ycp_src[0], ycp_src[ ref_1]),
-                                               get_diff_abs(ycp_src[0], ycp_src[-ref_1]) );
+                    : get_max(get_diff_abs(ycp_src[0], ycp_src[ref_0]),
+                        get_diff_abs(ycp_src[0], ycp_src[-ref_0]),
+                        get_diff_abs(ycp_src[0], ycp_src[ref_1]),
+                        get_diff_abs(ycp_src[0], ycp_src[-ref_1]));
             }
             PIXEL_YC base;
-            base.y  = (diff.y  < threshold_y)  ? avg.y  : ycp_src->y;
-            base.cb = (diff.cb < threshold_cb) ? avg.cb : ycp_src->cb;
-            base.cr = (diff.cr < threshold_cr) ? avg.cr : ycp_src->cr;
+            if (check) {
+                if (total) {
+                    base = ((diff.y < threshold_y) && (diff.cb < threshold_cb) && (diff.cr < threshold_cr)) ? YC_YELLOW : YC_BLACK;
+                }
+                else {
+                    base = ((diff.y < threshold_y) || (diff.cb < threshold_cb) || (diff.cr < threshold_cr)) ? YC_YELLOW : YC_BLACK;
+                }
+            }
+            else {
+                if (total) {
+                    if ((diff.y  < threshold_y) && (diff.cb < threshold_cb) && (diff.cr < threshold_cr)) {
+                        base = avg;
+                    }
+                    else {
+                        base = *ycp_src;
+                    }
+                }
+                else {
+                    base.y = (diff.y  < threshold_y) ? avg.y : ycp_src->y;
+                    base.cb = (diff.cb < threshold_cb) ? avg.cb : ycp_src->cb;
+                    base.cr = (diff.cr < threshold_cr) ? avg.cr : ycp_src->cr;
+                }
+            }
             xor128(&gen_rand);
-            ycp_dst->y  = base.y  + random_range((gen_rand.w & 0x0000ff),      ditherY);
+            ycp_dst->y = base.y + random_range((gen_rand.w & 0x0000ff), ditherY);
             ycp_dst->cb = base.cb + random_range((gen_rand.w & 0x00ff00) >> 8, ditherC);
-            ycp_dst->cr = base.cr + random_range((gen_rand.w & 0xff0000) >>16, ditherC);
+            ycp_dst->cr = base.cr + random_range((gen_rand.w & 0xff0000) >> 16, ditherC);
         }
     }
 }
+
